@@ -1,0 +1,18 @@
+[project]
+name = "vram-purge"
+version = "1.0.0"
+description = "VRAM purge button in the ComfyUI menu - clears ComfyUI from VRAM without restarting"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+classifiers = [
+    "Operating System :: OS Independent",
+]
+
+[project.urls]
+Repository = "https://github.com/yusrmuttaqien/comfyui-vram_purge-plugin"
+
+[tool.comfy]
+PublisherId = "yusrmuttaqien"
+DisplayName = "VRAM Purge"
+Icon = "https://raw.githubusercontent.com/yusrmuttaqien/comfyui-vram_purge-plugin/main/icon.png"
+requires-comfyui = ">=0.3.0"
