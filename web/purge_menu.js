@@ -11,20 +11,33 @@ const purgeVRAM = async (deep) => {
     }
 
     try {
-        const res = await api.fetchApi("/vram_purge/purge", {
+        let res = await api.fetchApi("/vram_purge/purge", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ deep }),
         });
+        // Some ComfyUI builds hand back a raw Response; normalize to JSON.
+        if (res && typeof res.json === "function") {
+            res = await res.json();
+        }
+        console.log("VRAM purge response:", res);
 
-        const used = (snap) =>
-            snap && snap.length ? `${snap[0].used_gb} GB` : "?";
+        const used = (snap) => {
+            if (!snap || !snap.length) return "?";
+            const d = snap[0];
+            if (d.used_gb != null) return `${d.used_gb} GB`;
+            return d.error ? `error: ${d.error}` : "?";
+        };
         const lines = [`Purged VRAM.`, `Used: ${used(res.before)} -> ${used(res.after)}`];
         if (res.context_reset) {
             lines.push(`CUDA context: ${res.context_reset[1]}`);
         }
         if (res.driver) {
             lines.push(`Driver free: ${res.driver.free_gb} / ${res.driver.total_gb} GB`);
+        }
+        // If we got no usable snapshot, dump the raw response so it's debuggable.
+        if ((!res.before || !res.before.length) && (!res.after || !res.after.length)) {
+            lines.push("(no device snapshot) raw: " + JSON.stringify(res));
         }
         window.alert(lines.join("\n"));
     } catch (e) {

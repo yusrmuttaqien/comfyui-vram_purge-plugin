@@ -1,4 +1,3 @@
-import asyncio
 import gc
 
 from aiohttp import web
@@ -129,9 +128,10 @@ async def _handle_purge(request):
     except Exception:
         deep = False
 
-    # The purge blocks (synchronize + device reset can take a moment),
-    # so run it off the aiohttp event loop.
-    result = await asyncio.to_thread(_purge, deep)
+    # Run directly in the handler (like the restart pack does). A deep
+    # purge can block briefly during synchronize/cudaDeviceReset; that is
+    # acceptable for a one-off action and avoids torch-in-a-thread edge cases.
+    result = _purge(deep)
     return web.json_response(result)
 
 
