@@ -36,20 +36,47 @@ def _snapshot():
     return out
 
 
+def _load_cuda_driver():
+    """Load the CUDA driver library (libcuda.so.1).
+
+    Returns a ctypes CDLL, or None if it cannot be loaded.
+    """
+    import ctypes
+
+    for name in ("libcuda.so.1", "libcuda.so"):
+        try:
+            return ctypes.CDLL(name)
+        except OSError:
+            continue
+    return None
+
+
 def _driver_mem():
     """Ground-truth VRAM from the CUDA driver, bypassing PyTorch.
 
-    Important: querying PyTorch after cudaDeviceReset() would lazily
+    Important: querying PyTorch after a device reset would lazily
     re-create the context and inflate the number. The driver call does
     not, so this is the honest 'what is actually in VRAM' reading.
+
+    Tries the Runtime API (cudaMemGetInfo) first, then the Driver API
+    (cuMemGetInfo_v2) -- some builds of libcuda.so.1 only export the
+    latter.
     """
+    lib = _load_cuda_driver()
+    if lib is None:
+        return None
     try:
         import ctypes
 
-        lib = ctypes.CDLL("libcuda.so.1")
         free = ctypes.c_size_t(0)
         total = ctypes.c_size_t(0)
-        if lib.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total)) == 0:
+        if hasattr(lib, "cudaMemGetInfo"):
+            rc = lib.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total))
+        elif hasattr(lib, "cuMemGetInfo_v2"):
+            rc = lib.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total))
+        else:
+            return None
+        if rc == 0:
             return {
                 "free_gb": _gb(free.value),
                 "total_gb": _gb(total.value),
@@ -61,12 +88,16 @@ def _driver_mem():
 
 
 def _reset_cuda_context():
-    """Aggressively release the CUDA context via cudaDeviceReset().
+    """Aggressively release the CUDA context.
 
     A normal unload frees model weights and PyTorch's cached blocks, but
     the CUDA context itself (a few hundred MB) stays resident for the
-    life of the process -- that is the 'squatting'. cudaDeviceReset()
-    drops it. Best effort: returns (ok, note).
+    life of the process -- that is the 'squatting'. A device reset drops
+    it. Best effort: returns (ok, note).
+
+    Tries the Runtime API (cudaDeviceReset) first, then the Driver API
+    (cuDeviceReset) -- some builds of libcuda.so.1 only export the
+    latter.
     """
     import torch
 
@@ -74,16 +105,23 @@ def _reset_cuda_context():
         return False, "CUDA not available"
     try:
         torch.cuda.synchronize()
-        import ctypes
-
-        lib = ctypes.CDLL("libcuda.so.1")
-        rc = lib.cudaDeviceReset()
-        # cudaSuccess == 0
+        lib = _load_cuda_driver()
+        if lib is None:
+            return False, "could not load libcuda.so.1"
+        if hasattr(lib, "cudaDeviceReset"):
+            rc = lib.cudaDeviceReset()
+            name = "cudaDeviceReset()"
+        elif hasattr(lib, "cuDeviceReset"):
+            rc = lib.cuDeviceReset()
+            name = "cuDeviceReset()"
+        else:
+            return False, "neither cudaDeviceReset nor cuDeviceReset available"
+        # cudaSuccess / CUDA_SUCCESS == 0
         if rc == 0:
-            return True, "cudaDeviceReset() succeeded"
-        return False, f"cudaDeviceReset() returned code {rc}"
+            return True, f"{name} succeeded"
+        return False, f"{name} returned code {rc}"
     except Exception as e:
-        return False, f"cudaDeviceReset() failed: {e}"
+        return False, f"device reset failed: {e}"
 
 
 def _purge(deep):
