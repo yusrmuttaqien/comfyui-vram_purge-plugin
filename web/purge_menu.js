@@ -28,9 +28,9 @@ const purgeVRAM = async (deep) => {
             if (d.used_gb != null) return `${d.used_gb} GB`;
             return d.error ? `error: ${d.error}` : "?";
         };
-        const lines = [`Purged VRAM.`, `Used: ${used(res.before)} -> ${used(res.after)}`];
+        const lines = [`Purged VRAM.`, `Backend: ${res.backend || "?"}`, `Used: ${used(res.before)} -> ${used(res.after)}`];
         if (res.context_reset) {
-            lines.push(`CUDA context: ${res.context_reset[1]}`);
+            lines.push(`Context reset: ${res.context_reset[1]}`);
         }
         if (res.driver) {
             lines.push(`Driver free: ${res.driver.free_gb} / ${res.driver.total_gb} GB`);

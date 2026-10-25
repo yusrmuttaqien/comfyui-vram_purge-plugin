@@ -36,14 +36,38 @@ def _snapshot():
     return out
 
 
-def _load_cuda_driver():
-    """Load the CUDA driver library (libcuda.so.1).
+def _detect_backend():
+    """Detect the GPU backend ComfyUI is using.
 
+    Returns 'nvidia', 'amd', or 'other'. Reuses ComfyUI's own detection so
+    it stays in sync with how ComfyUI sees the hardware.
+    """
+    try:
+        import comfy.model_management as mm
+
+        if mm.is_nvidia():
+            return "nvidia"
+        if mm.is_amd():
+            return "amd"
+    except Exception:
+        pass
+    return "other"
+
+
+def _load_driver_lib(backend):
+    """Load the vendor driver library for the given backend.
+
+    NVIDIA: libcuda.so.1 (Driver + Runtime API).
+    AMD:    libhip.so / libhiphost.so (HIP runtime, CUDA-compatible).
     Returns a ctypes CDLL, or None if it cannot be loaded.
     """
     import ctypes
 
-    for name in ("libcuda.so.1", "libcuda.so"):
+    candidates = {
+        "nvidia": ("libcuda.so.1", "libcuda.so"),
+        "amd": ("libhip.so", "libhiphost.so"),
+    }.get(backend, ())
+    for name in candidates:
         try:
             return ctypes.CDLL(name)
         except OSError:
@@ -52,17 +76,19 @@ def _load_cuda_driver():
 
 
 def _driver_mem():
-    """Ground-truth VRAM from the CUDA driver, bypassing PyTorch.
+    """Ground-truth VRAM from the vendor driver, bypassing PyTorch.
 
     Important: querying PyTorch after a device reset would lazily
     re-create the context and inflate the number. The driver call does
     not, so this is the honest 'what is actually in VRAM' reading.
 
-    Tries the Runtime API (cudaMemGetInfo) first, then the Driver API
-    (cuMemGetInfo_v2) -- some builds of libcuda.so.1 only export the
-    latter.
+    NVIDIA: cudaMemGetInfo / cuMemGetInfo_v2.
+    AMD:    hipMemGetInfo.
     """
-    lib = _load_cuda_driver()
+    backend = _detect_backend()
+    if backend not in ("nvidia", "amd"):
+        return None
+    lib = _load_driver_lib(backend)
     if lib is None:
         return None
     try:
@@ -70,12 +96,18 @@ def _driver_mem():
 
         free = ctypes.c_size_t(0)
         total = ctypes.c_size_t(0)
-        if hasattr(lib, "cudaMemGetInfo"):
-            rc = lib.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total))
-        elif hasattr(lib, "cuMemGetInfo_v2"):
-            rc = lib.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total))
-        else:
-            return None
+        if backend == "nvidia":
+            if hasattr(lib, "cudaMemGetInfo"):
+                rc = lib.cudaMemGetInfo(ctypes.byref(free), ctypes.byref(total))
+            elif hasattr(lib, "cuMemGetInfo_v2"):
+                rc = lib.cuMemGetInfo_v2(ctypes.byref(free), ctypes.byref(total))
+            else:
+                return None
+        else:  # amd
+            if hasattr(lib, "hipMemGetInfo"):
+                rc = lib.hipMemGetInfo(ctypes.byref(free), ctypes.byref(total))
+            else:
+                return None
         if rc == 0:
             return {
                 "free_gb": _gb(free.value),
@@ -87,36 +119,41 @@ def _driver_mem():
     return None
 
 
-def _reset_cuda_context():
-    """Aggressively release the CUDA context.
+def _reset_context():
+    """Aggressively release the GPU context (deep purge).
 
     A normal unload frees model weights and PyTorch's cached blocks, but
-    the CUDA context itself (a few hundred MB) stays resident for the
+    the GPU context itself (a few hundred MB) stays resident for the
     life of the process -- that is the 'squatting'. A device reset drops
     it. Best effort: returns (ok, note).
 
-    Tries the Runtime API (cudaDeviceReset) first, then the Driver API
-    (cuDeviceReset) -- some builds of libcuda.so.1 only export the
-    latter.
+    NVIDIA: cudaDeviceReset / cuDeviceReset via libcuda.so.1.
+    AMD:    hipDeviceReset via libhip.so.
+    Others: no C-level reset available, so deep == soft there.
     """
+    backend = _detect_backend()
+    if backend not in ("nvidia", "amd"):
+        return False, f"context reset not available on this backend ({backend})"
     import torch
 
-    if not torch.cuda.is_available():
-        return False, "CUDA not available"
     try:
         torch.cuda.synchronize()
-        lib = _load_cuda_driver()
+        lib = _load_driver_lib(backend)
         if lib is None:
-            return False, "could not load libcuda.so.1"
-        if hasattr(lib, "cudaDeviceReset"):
-            rc = lib.cudaDeviceReset()
-            name = "cudaDeviceReset()"
-        elif hasattr(lib, "cuDeviceReset"):
-            rc = lib.cuDeviceReset()
-            name = "cuDeviceReset()"
-        else:
-            return False, "neither cudaDeviceReset nor cuDeviceReset available"
-        # cudaSuccess / CUDA_SUCCESS == 0
+            return False, f"could not load driver library for {backend}"
+        if backend == "nvidia":
+            if hasattr(lib, "cudaDeviceReset"):
+                rc, name = lib.cudaDeviceReset(), "cudaDeviceReset()"
+            elif hasattr(lib, "cuDeviceReset"):
+                rc, name = lib.cuDeviceReset(), "cuDeviceReset()"
+            else:
+                return False, "neither cudaDeviceReset nor cuDeviceReset available"
+        else:  # amd
+            if hasattr(lib, "hipDeviceReset"):
+                rc, name = lib.hipDeviceReset(), "hipDeviceReset()"
+            else:
+                return False, "hipDeviceReset not available"
+        # cudaSuccess / HIP_SUCCESS == 0
         if rc == 0:
             return True, f"{name} succeeded"
         return False, f"{name} returned code {rc}"
@@ -143,7 +180,7 @@ def _purge(deep):
     context_reset = None
     driver = None
     if deep:
-        context_reset = _reset_cuda_context()
+        context_reset = _reset_context()
         driver = _driver_mem()
 
     after = _snapshot()
@@ -151,6 +188,7 @@ def _purge(deep):
     return {
         "status": "purged",
         "deep": deep,
+        "backend": _detect_backend(),
         "context_reset": context_reset,
         "before": before,
         "after": after,

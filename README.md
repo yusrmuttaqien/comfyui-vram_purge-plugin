@@ -12,8 +12,8 @@ life of the process. That residual is the "VRAM squatting" you want gone.
 
 | Button | What it does | What stays in VRAM |
 | --- | --- | --- |
-| **Purge VRAM** | Unload all models + `gc.collect()` + `torch.cuda.empty_cache()` + `ipc_collect()` | CUDA context (~0.2–1 GB) |
-| **Purge VRAM (deep)** | Everything above **plus** `cudaDeviceReset()` to destroy the CUDA context | ~nothing (re-created on next generation) |
+| **Purge VRAM** | Unload all models + `gc.collect()` + `torch.cuda.empty_cache()` + `ipc_collect()` | GPU context (~0.2–1 GB) |
+| **Purge VRAM (deep)** | Everything above **plus** a device reset to destroy the GPU context | ~nothing (re-created on next generation) |
 
 Use **deep** when you want ComfyUI *completely* out of VRAM (e.g. to hand the GPU
 to another app). The context is lazily re-created the next time you generate, so
@@ -30,14 +30,14 @@ The endpoint (`POST /vram_purge/purge`) runs, in order:
 3. `comfy.model_management.soft_empty_cache(force=True)` — returns PyTorch's
    cached CUDA blocks to the driver (`synchronize` + `empty_cache` +
    `ipc_collect`).
-4. *(deep only)* `cudaDeviceReset()` via ctypes — releases the CUDA context.
+4. *(deep only)* a device reset via ctypes — releases the GPU context.
+   NVIDIA: `cuDeviceReset` / `cudaDeviceReset` via `libcuda.so.1`.
+   AMD: `hipDeviceReset` via `libhip.so`.
+   Other backends: skipped (no C-level reset), so deep == soft there.
 5. Reports a before/after VRAM snapshot. In deep mode it also reports a
-   **driver-level** free/total reading (`cudaMemGetInfo`) so you can verify the
-   context is actually gone — querying PyTorch after the reset would re-create
-   the context and inflate the number.
-
-All of this runs off the aiohttp event loop (`asyncio.to_thread`), so a slow
-`cudaDeviceReset()` won't stall the UI.
+   **driver-level** free/total reading (`cuMemGetInfo_v2` / `hipMemGetInfo`) so
+   you can verify the context is actually gone — querying PyTorch after the reset
+   would re-create the context and inflate the number.
 
 ## Install
 
@@ -57,10 +57,13 @@ main menu bar.
 
 ## Notes / caveats
 
-- **NVIDIA only for deep mode.** `cudaDeviceReset()` and `libcuda.so.1` are
-  NVIDIA. On AMD/ROCm the deep button will report that CUDA reset was skipped;
-  the soft purge still works.
-- **Deep mode is best-effort.** `cudaDeviceReset()` blocks until outstanding GPU
+- **Soft purge works on every backend** ComfyUI supports (NVIDIA, AMD/ROCm,
+  Apple MPS, Intel XPU, Ascend NPU, MLU, DirectML, CPU) — it only uses
+  ComfyUI's backend-agnostic unload/cache functions.
+- **Deep mode's context reset is NVIDIA + AMD.** It calls the vendor driver
+  directly (`libcuda.so.1` / `libhip.so`). On other backends (MPS, XPU, ...) the
+  reset is skipped and deep behaves like soft; the response says so.
+- **Deep mode is best-effort.** The device reset blocks until outstanding GPU
   work finishes. Click it when ComfyUI is idle (not mid-generation) to avoid a
   hang. If it fails, the response says so and nothing is broken — you just keep
   the context.
