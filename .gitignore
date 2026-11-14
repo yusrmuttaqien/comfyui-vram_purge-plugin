@@ -132,3 +132,5 @@ dmypy.json
 models/
 outputs/
 temp/
+# Node
+node_modules/
