@@ -105,6 +105,14 @@ const CSS = `
   margin-left: 8px;
 }
 .comfort-topbar-focus:hover { background: #444; }
+.comfort-topbar-focus.ninfer-spinning .ninfer-label { display: none; }
+.comfort-topbar-focus .ninfer-spinner { display: none; }
+.comfort-topbar-focus.ninfer-spinning .ninfer-spinner { display: inline-block; }
+.ninfer-spinner {
+  width: 12px; height: 12px; border: 2px solid #888; border-top-color: #eee;
+  border-radius: 50%; animation: ninfer-spin 0.8s linear infinite; vertical-align: middle;
+}
+@keyframes ninfer-spin { to { transform: rotate(360deg); } }
 `;
 
 const styleEl = document.createElement("style");
@@ -541,12 +549,18 @@ function _installHooks() {
     let proceed = true;
     for (const gate of Array.from(registry)) {
       if (gate.removed) continue;
+      _setSpinner(true);
       const v = await gate.suspendChecked();
+      _setSpinner(false);
       if (!v.proceed) { proceed = false; break; }
     }
     if (!proceed) return Promise.resolve();
     return orig.apply(app, args);
   };
+}
+
+function _setSpinner(on) {
+  if (focusBtn) focusBtn.classList.toggle("ninfer-spinning", on);
 }
 
 // --- Focus button ---
@@ -574,7 +588,13 @@ function _ensureFocusButton() {
   btn.type = "button";
   btn.className = "comfort-topbar-focus";
   btn.title = "Focus NInfer gate";
-  btn.textContent = "NInfer";
+  const spinner = document.createElement("span");
+  spinner.className = "ninfer-spinner";
+  const label = document.createElement("span");
+  label.className = "ninfer-label";
+  label.textContent = "⚡ NInfer";
+  btn.appendChild(spinner);
+  btn.appendChild(label);
   btn.addEventListener("click", () => {
     const gate = _findFocusableGate();
     if (!gate) return;
@@ -594,13 +614,19 @@ function _ensureFocusButton() {
     canvas.centerOnNode(gate);
     canvas.setDirty(true);
   });
-  anchor.parentElement.insertBefore(btn, anchor.nextSibling);
+  anchor.parentElement.appendChild(btn);
   focusBtn = btn;
 }
 
 setInterval(() => {
   _ensureFocusButton();
-  if (focusBtn) focusBtn.style.display = _findFocusableGate() ? "" : "none";
+  if (!focusBtn) return;
+  const gate = _findFocusableGate();
+  focusBtn.style.display = gate ? "" : "none";
+  if (gate) {
+    const spinning = gate.st?.phase === "suspending" || gate.st?.phase === "busy";
+    focusBtn.classList.toggle("ninfer-spinning", spinning);
+  }
 }, 500);
 
 // --- Register ---
