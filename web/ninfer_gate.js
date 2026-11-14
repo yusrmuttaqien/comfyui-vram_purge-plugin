@@ -1,4 +1,4 @@
-// NInfer Suspend Gate (comfort) — self-contained for VRAM Purge plugin.
+// NInfer Suspend Gate: self-contained for VRAM Purge plugin.
 // Frees GPU memory by suspending NInfer models on queue.
 import { app } from "../../scripts/app.js";
 
@@ -65,7 +65,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // --- CSS ---
 
 const CSS = `
-.comfort-ninfer { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
+.comfort-ninfer { display: flex; flex-direction: column; gap: 4px; font-size: 12px; height: 100%; overflow-y: auto; }
 .comfort-ninfer-url, .comfort-ninfer-timeout {
   width: 100%; padding: 4px 6px; border-radius: 4px;
   border: 1px solid #555; background: #2a2a2a; color: #eee; font-size: 12px;
@@ -120,27 +120,57 @@ styleEl.setAttribute("data-comfort-ninfer", "true");
 styleEl.textContent = CSS;
 document.head.appendChild(styleEl);
 
-// --- Virtual node base (minimal, self-contained) ---
+// --- Virtual node base (self-contained) ---
+
+function _findProtoPropDescriptor(obj, prop) {
+  let proto = Object.getPrototypeOf(obj);
+  while (proto) {
+    const desc = Object.getOwnPropertyDescriptor(proto, prop);
+    if (desc) return desc;
+    proto = Object.getPrototypeOf(proto);
+  }
+  return undefined;
+}
 
 class ComfortVirtualNode extends LGraphNode {
   constructor(title) {
-    super();
-    this.title = title || "virtual";
+    super(title);
+    this.widgets = this.widgets || [];
+    this.properties = this.properties || {};
     this.isVirtualNode = true;
-    this.size = [200, 100];
-    this.color = null;
-    this.backgroundColor = null;
-    this._modeField = LGraphEventMode.ALWAYS;
+    this.removed = false;
+    this.configuring = false;
+
+    const protoMode = _findProtoPropDescriptor(this, "mode");
+    const readMode = () => {
+      if (protoMode?.get) return protoMode.get.call(this);
+      return this.__comfort_mode;
+    };
+    Object.defineProperty(this, "mode", {
+      configurable: true,
+      enumerable: true,
+      get: readMode,
+      set: (mode) => {
+        const old = readMode();
+        if (protoMode?.set) protoMode.set.call(this, mode);
+        else this.__comfort_mode = mode;
+        if (old !== mode) this.onModeChange?.(old, mode);
+      },
+    });
   }
-  get mode() { return this._modeField; }
-  set mode(v) {
-    const old = this._modeField;
-    this._modeField = v;
-    if (old !== v) this.onModeChange?.(v, old);
+
+  configure(info) {
+    this.configuring = true;
+    super.configure(info);
+    this.configuring = false;
   }
-  onModeChange() {}
-  get title() { return this._title; }
-  set title(v) { this._title = v; }
+
+  onRemoved() {
+    super.onRemoved?.();
+    this.removed = true;
+  }
+
+  getHelp() { return ""; }
 }
 
 // --- NInfer Gate Node ---
@@ -154,6 +184,7 @@ class NInferGateNode extends ComfortVirtualNode {
   constructor() {
     super(NINFER_GATE);
     this.properties = { url: "", timeout: "indefinite", selected: null };
+    this.setSize([MIN_W, 200]);
     this.st = this._setupWidget();
     registry.add(this);
     _ensureTimers();
@@ -366,7 +397,7 @@ class NInferGateNode extends ComfortVirtualNode {
     let text;
     switch (st.phase) {
       case "suspending": text = `Suspending ${st.phaseModel}… ${elapsed}s`; break;
-      case "busy": text = `NInfer busy — waiting… ${elapsed}s`; break;
+      case "busy": text = `NInfer busy - waiting… ${elapsed}s`; break;
       case "done": text = `✓ ${st.resultText}`; break;
       case "error": text = `✗ ${st.resultText}`; break;
       default: text = this._idleSummary();
@@ -377,13 +408,7 @@ class NInferGateNode extends ComfortVirtualNode {
     st.skipBtn.hidden = !active;
   }
 
-  _layout() {
-    const n = this.st.models.length;
-    const h = PAD_Y * 2 + FIELD_H + FIELD_H + STATUS_H + BULK_H + n * ROW_H;
-    const w = Math.max(this.size?.[0] || 0, MIN_W);
-    const cur = this.size;
-    if (!cur || cur[1] !== h || cur[0] !== w) this.setSize?.([w, h]);
-  }
+  _layout() { /* no-op: size is user-controlled */ }
 
   async refresh(fresh = false) {
     const st = this.st;
@@ -480,7 +505,7 @@ class NInferGateNode extends ComfortVirtualNode {
       }
       st.abort = null;
       if (st.cancel) { this._finish("Cancelled", false); return { proceed: false }; }
-      if (st.skip) { this._finish("Skipped — running now", false); return { proceed: true }; }
+      if (st.skip) { this._finish("Skipped - running now", false); return { proceed: true }; }
       const total = Math.round((Date.now() - t0) / 1000);
       this._finish(`Suspended ${targets.length} model${targets.length === 1 ? "" : "s"} (${total}s)`, false);
       st.resultHold = 2;

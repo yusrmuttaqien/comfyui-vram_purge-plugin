@@ -1,7 +1,7 @@
 # ComfyUI-VRAM-Purge
 
 Adds a **Purge VRAM** button to the ComfyUI main menu. It clears ComfyUI out of
-VRAM **without restarting** the server — unlike the restart-menu pack, this one
+VRAM **without restarting** the server - unlike the restart-menu pack, this one
 just frees memory in place.
 
 ## Why two buttons
@@ -23,20 +23,20 @@ there is no penalty beyond a one-time re-init.
 
 The endpoint (`POST /vram_purge/purge`) runs, in order:
 
-1. `comfy.model_management.unload_all_models()` — unloads every loaded model
+1. `comfy.model_management.unload_all_models()` - unloads every loaded model
    (checkpoint, CLIP, VAE, diffusion model, LoRA, controlnet, adapter,
    upscaler, ...).
-2. `gc.collect()` — drops lingering Python references to CUDA tensors.
-3. `comfy.model_management.soft_empty_cache(force=True)` — returns PyTorch's
+2. `gc.collect()` - drops lingering Python references to CUDA tensors.
+3. `comfy.model_management.soft_empty_cache(force=True)` - returns PyTorch's
    cached CUDA blocks to the driver (`synchronize` + `empty_cache` +
    `ipc_collect`).
-4. *(deep only)* a device reset via ctypes — releases the GPU context.
+4. *(deep only)* a device reset via ctypes - releases the GPU context.
    NVIDIA: `cuDeviceReset` / `cudaDeviceReset` via `libcuda.so.1`.
    AMD: `hipDeviceReset` via `libhip.so`.
    Other backends: skipped (no C-level reset), so deep == soft there.
 5. Reports a before/after VRAM snapshot. In deep mode it also reports a
    **driver-level** free/total reading (`cuMemGetInfo_v2` / `hipMemGetInfo`) so
-   you can verify the context is actually gone — querying PyTorch after the reset
+   you can verify the context is actually gone - querying PyTorch after the reset
    would re-create the context and inflate the number.
 
 ## Install
@@ -47,27 +47,49 @@ Drop the folder into your `custom_nodes/` directory:
 custom_nodes/ComfyUI-VRAM-Purge/
     __init__.py
     server_purge.py
+    server_ninfer.py
     pyproject.toml
     web/
         purge_menu.js
+        ninfer_gate.js
 ```
 
 Restart ComfyUI once (to load the extension), then the two buttons appear in the
 main menu bar.
 
+## NInfer Suspend Gate
+
+A node that frees GPU memory for ComfyUI by suspending selected NInfer models on queue.
+
+- Set the **NInfer URL** (e.g. `http://host:30001`).
+- The node polls `/v1/models` and lists each model with its status. **loaded**
+  models are selectable (checked by default). **Select all** / **Deselect all**
+  for bulk control.
+- On every Run, each checked loaded model is suspended
+  (`POST /v1/models/{id}/suspend`) and the queue is held until it returns.
+- If NInfer is busy (`409 model_busy`) the gate waits and retries until it
+  idles or the **busy timeout** elapses (default *indefinite*, or a number of
+  minutes).
+- Suspended models stay suspended (this plugin never resumes them).
+- NInfer calls go through a Python proxy (`/comfort/ninfer/forward`) to avoid
+  CORS between the browser and NInfer.
+- A top-bar **NInfer** button appears while a gate is in the current graph.
+  Clicking it focuses and zooms to the gate. A spinner shows while a suspend
+  is in progress.
+
 ## Notes / caveats
 
 - **Soft purge works on every backend** ComfyUI supports (NVIDIA, AMD/ROCm,
-  Apple MPS, Intel XPU, Ascend NPU, MLU, DirectML, CPU) — it only uses
+  Apple MPS, Intel XPU, Ascend NPU, MLU, DirectML, CPU) - it only uses
   ComfyUI's backend-agnostic unload/cache functions.
 - **Deep mode's context reset is NVIDIA + AMD.** It calls the vendor driver
   directly (`libcuda.so.1` / `libhip.so`). On other backends (MPS, XPU, ...) the
-  reset is skipped and deep behaves like soft; the response says so.
+  reset is skipped and deep behaves like soft. The response says so.
 - **Deep mode is best-effort.** The device reset blocks until outstanding GPU
   work finishes. Click it when ComfyUI is idle (not mid-generation) to avoid a
-  hang. If it fails, the response says so and nothing is broken — you just keep
+  hang. If it fails, the response says so and nothing is broken - you just keep
   the context.
-- **No restart.** The server keeps running; your workflow, queue, and loaded
+- **No restart.** The server keeps running. Your workflow, queue, and loaded
   settings are untouched. Only GPU memory is released.
 - The soft purge is the safe default and matches what ComfyUI's own "unload all
   models" machinery does.
