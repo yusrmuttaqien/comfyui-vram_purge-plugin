@@ -1,14 +1,24 @@
 // NInfer Suspend Gate: self-contained for VRAM Purge plugin.
 // Frees GPU memory by suspending NInfer models on queue.
-import { app } from "../../scripts/app.js";
+//
+// Feedback model (no idle polling):
+// - A module-level "hold" state machine covers the whole Run flow:
+//   checking -> suspending -> busy -> draining -> queued | error | cancelled
+//   Every transition renders node status + chrome button synchronously.
+// - Run clicks made while a hold is active join it (batched) and are
+//   submitted to ComfyUI in click order once suspends complete.
+// - A 250ms ticker exists only while a hold is active (elapsed seconds).
+// - Model list refreshes on interaction (hover/click/URL change), on
+//   hold start (always a fresh fetch), on hold end, on tab visibility,
+//   and on focus-button click. Status shows the data age.
+import { app } from "/scripts/app.js";
 
 const NINFER_GATE = "NInfer Suspend Gate";
 const MIN_W = 300;
-const AMBIENT_MS = 3000;
-const ELAPSED_MS = 500;
-const BUSY_RETRY_MS = 2000;
+const BUSY_RETRY_MS = 5000;
+const TICKER_MS = 250;
+const HOVER_WINDOW_MS = 1000; // hover refresh window
 const TIMEOUT_OPTIONS = ["indefinite", "1", "5", "10", "15", "30", "60"];
-const MODEL_CACHE_MS = 1000;
 
 // --- Types ---
 
@@ -34,15 +44,48 @@ interface GateState {
   rowsEl: HTMLDivElement;
   models: NInferModel[];
   selected: Set<string>;
-  phase: "idle" | "suspending" | "busy" | "done" | "error";
+  modelsAt: number;
+  refreshing: boolean;
+}
+
+type HoldPhase =
+  | "checking"
+  | "suspending"
+  | "busy"
+  | "draining"
+  | "queued"
+  | "error"
+  | "cancelled";
+
+interface Waiter {
+  args: unknown[];
+  done: Promise<unknown>;
+  resolveDone: (v: unknown) => void;
+  rejectDone: (e: unknown) => void;
+  ready: Promise<void>;
+  state: "waiting" | "submitting" | "settled";
+}
+
+interface Hold {
+  phase: HoldPhase;
   phaseModel: string;
+  phaseGate: NInferGateNode | null;
   phaseStart: number;
-  resultText: string;
-  resultHold: number;
-  polling: boolean;
-  cancel: boolean;
-  skip: boolean;
+  waiters: Waiter[];
+  intent: "none" | "cancel" | "skip";
   abort: AbortController | null;
+  resultText: string;
+  isError: boolean;
+  covered: Set<string>;
+  startedAt: number;
+  drainIndex: number;
+}
+
+interface Outcome {
+  text: string;
+  isError: boolean;
+  cancelled: boolean;
+  at: number;
 }
 
 // --- API ---
@@ -74,13 +117,13 @@ const inFlight = new Map<string, Promise<NInferModel[]>>();
 
 async function fetchModels(
   base: string,
-  useCache: boolean,
+  maxAgeMs: number,
   signal?: AbortSignal
 ): Promise<NInferModel[]> {
   const key = base + "/v1/models";
-  if (useCache) {
+  if (maxAgeMs > 0) {
     const hit = modelCache.get(key);
-    if (hit && Date.now() - hit.at < MODEL_CACHE_MS) return hit.models;
+    if (hit && Date.now() - hit.at < maxAgeMs) return hit.models;
   }
   const pending = inFlight.get(key);
   if (pending) return pending;
@@ -119,6 +162,8 @@ const CSS = `
   display: flex; align-items: center; gap: 8px; min-height: 24px;
   font-size: 11px; color: #aaa;
 }
+.comfort-ninfer-status-text.ok { color: #86efac; }
+.comfort-ninfer-status-text.err { color: #fca5a5; }
 .comfort-ninfer-ctrl {
   padding: 2px 8px; border-radius: 4px; border: 1px solid #555;
   background: #333; color: #eee; cursor: pointer; font-size: 11px;
@@ -136,6 +181,8 @@ const CSS = `
 }
 .comfort-ninfer-row:hover { background: rgba(255,255,255,0.05); }
 .comfort-ninfer-row.off { opacity: 0.5; }
+.comfort-ninfer-row .ninfer-spinner { display: none; }
+.comfort-ninfer-row.suspending .ninfer-spinner { display: inline-block; }
 .comfort-node-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .comfort-ninfer-badge {
   font-size: 10px; padding: 1px 5px; border-radius: 3px;
@@ -150,6 +197,8 @@ const CSS = `
   margin-left: 8px;
 }
 .comfort-topbar-focus:hover { background: #444; }
+.comfort-topbar-focus.ninfer-ok { border-color: #16a34a; }
+.comfort-topbar-focus.ninfer-error { border-color: #dc2626; }
 .comfort-topbar-focus.ninfer-spinning .ninfer-label { display: none; }
 .comfort-topbar-focus .ninfer-spinner { display: none; }
 .comfort-topbar-focus.ninfer-spinning .ninfer-spinner { display: inline-block; }
@@ -241,12 +290,52 @@ class ComfortVirtualNode extends LGraphNode {
   }
 }
 
+// --- Hold state (module-level, shared across all gates and Run clicks) ---
+
+let hold: Hold | null = null;
+let lastOutcome: Outcome | null = null;
+let ticker: ReturnType<typeof setInterval> | null = null;
+let ensureChain: Promise<void> = Promise.resolve();
+
+function isActivePhase(h: Hold | null): boolean {
+  return (
+    !!h &&
+    (h.phase === "checking" ||
+      h.phase === "suspending" ||
+      h.phase === "busy" ||
+      h.phase === "draining")
+  );
+}
+
+function _startTicker(): void {
+  if (ticker) return;
+  ticker = setInterval(() => {
+    if (hold) renderHold();
+  }, TICKER_MS);
+}
+
+function _stopTicker(): void {
+  if (ticker) {
+    clearInterval(ticker);
+    ticker = null;
+  }
+}
+
+function renderHold(): void {
+  for (const g of Array.from(registry)) {
+    if (g.removed) continue;
+    try {
+      g._renderStatus();
+    } catch {}
+  }
+  _renderFocusButton();
+}
+
 // --- NInfer Gate Node ---
 
-const registry = new Set<ComfortVirtualNode & NInferGateNode>();
+const registry = new Set<NInferGateNode>();
 let hooksInstalled = false;
-let ambientTimer: ReturnType<typeof setInterval> | null = null;
-let elapsedTimer: ReturnType<typeof setInterval> | null = null;
+let origQueue: ((...a: unknown[]) => Promise<unknown>) | null = null;
 
 class NInferGateNode extends ComfortVirtualNode {
   st: GateState;
@@ -257,7 +346,6 @@ class NInferGateNode extends ComfortVirtualNode {
     this.setSize([MIN_W, 200]);
     this.st = this._setupWidget();
     registry.add(this);
-    _ensureTimers();
     _installHooks();
   }
 
@@ -268,22 +356,13 @@ class NInferGateNode extends ComfortVirtualNode {
   onAdded(): void {
     super.onAdded?.();
     this._syncFields();
-    this.refresh();
+    this.refresh(true);
+    _updateFocusVisibility();
   }
   onRemoved(): void {
     registry.delete(this);
-    if (!registry.size) {
-      clearInterval(ambientTimer);
-      ambientTimer = null;
-      clearInterval(elapsedTimer);
-      elapsedTimer = null;
-    }
+    _updateFocusVisibility();
     super.onRemoved?.();
-  }
-
-  updateLiveStatus(): void {
-    if (this.st.phase === "suspending" || this.st.phase === "busy")
-      this._renderStatus();
   }
 
   _baseUrl(): string {
@@ -375,24 +454,19 @@ class NInferGateNode extends ComfortVirtualNode {
       rowsEl,
       models: [],
       selected: new Set(),
-      phase: "idle",
-      phaseModel: "",
-      phaseStart: 0,
-      resultText: "",
-      resultHold: 0,
-      polling: false,
-      cancel: false,
-      skip: false,
-      abort: null,
+      modelsAt: 0,
+      refreshing: false,
     };
 
     cancelBtn.addEventListener("click", () => {
-      st.cancel = true;
-      st.abort?.abort();
+      if (!hold) return;
+      hold.intent = "cancel";
+      hold.abort?.abort();
     });
     skipBtn.addEventListener("click", () => {
-      st.skip = true;
-      st.abort?.abort();
+      if (!hold) return;
+      hold.intent = "skip";
+      hold.abort?.abort();
     });
 
     rowsEl.addEventListener("change", (e: Event) => {
@@ -424,14 +498,22 @@ class NInferGateNode extends ComfortVirtualNode {
     urlInput.addEventListener("change", () => {
       this.properties.url = urlInput.value.trim();
       this.properties.selected = null;
-      st.phase = "idle";
-      st.resultText = "";
       st.models = [];
+      st.modelsAt = 0;
       st.selected = new Set();
-      this.refresh();
+      lastOutcome = null;
+      this.refresh(true);
     });
     timeoutSel.addEventListener("change", () => {
       this.properties.timeout = timeoutSel.value;
+    });
+
+    // Interaction-driven refresh: hover uses a 1s window, press is fresh.
+    el.addEventListener("pointerenter", () => {
+      this.refresh(false);
+    });
+    el.addEventListener("pointerdown", () => {
+      this.refresh(true);
     });
 
     if (typeof this.addDOMWidget === "function") {
@@ -449,6 +531,19 @@ class NInferGateNode extends ComfortVirtualNode {
     const t = String(this.properties.timeout || "indefinite");
     st.timeoutSel.value = TIMEOUT_OPTIONS.includes(t) ? t : "indefinite";
     st.selected = this._computeSelected(st.models);
+  }
+
+  _setModels(models: NInferModel[]): void {
+    const st = this.st;
+    st.models = models;
+    st.modelsAt = Date.now();
+    if (this.properties.selected == null) {
+      this.properties.selected = models
+        .filter((m) => m.value === "loaded")
+        .map((m) => m.id);
+    }
+    st.selected = this._computeSelected(models);
+    this._renderRows();
   }
 
   _renderRows(): void {
@@ -471,6 +566,9 @@ class NInferGateNode extends ComfortVirtualNode {
       cb.checked = st.selected.has(m.id);
       cb.dataset.id = m.id;
       rowEl.appendChild(cb);
+      const spinner = document.createElement("span");
+      spinner.className = "ninfer-spinner";
+      rowEl.appendChild(spinner);
       const title = document.createElement("span");
       title.className = "comfort-node-title";
       title.textContent = m.id;
@@ -485,6 +583,23 @@ class NInferGateNode extends ComfortVirtualNode {
       rowEl.appendChild(badge);
       st.rowsEl.appendChild(rowEl);
     }
+    this._updateRowSpinners();
+  }
+
+  _updateRowSpinners(): void {
+    const active =
+      hold?.phase === "suspending" &&
+      hold.phaseGate === this &&
+      !!hold.phaseModel;
+    const rows = this.st.rowsEl.children;
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i] as HTMLElement;
+      if (!row.dataset?.id) continue;
+      row.classList.toggle(
+        "suspending",
+        active && row.dataset.id === hold!.phaseModel
+      );
+    }
   }
 
   _idleSummary(): string {
@@ -492,240 +607,342 @@ class NInferGateNode extends ComfortVirtualNode {
     const m = this.st.models;
     if (!m.length) return "Loading models…";
     const loaded = m.filter((x) => x.value === "loaded").length;
-    if (!loaded) return "No loaded models";
-    return `${loaded} loaded · ${m.length - loaded} other`;
+    const age = this.st.modelsAt
+      ? ` · checked ${Math.max(0, Math.round((Date.now() - this.st.modelsAt) / 1000))}s ago`
+      : "";
+    if (!loaded) return `No loaded models${age}`;
+    return `${loaded} loaded · ${m.length - loaded} other${age}`;
   }
 
   _renderStatus(): void {
     const st = this.st;
-    const elapsed = Math.max(0, Math.round((Date.now() - st.phaseStart) / 1000));
+    const h = hold;
     let text: string;
-    switch (st.phase) {
-      case "suspending":
-        text = `Suspending ${st.phaseModel}… ${elapsed}s`;
-        break;
-      case "busy":
-        text = `NInfer busy - waiting… ${elapsed}s`;
-        break;
-      case "done":
-        text = `✓ ${st.resultText}`;
-        break;
-      case "error":
-        text = `✗ ${st.resultText}`;
-        break;
-      default:
-        text = this._idleSummary();
+    let tone: "info" | "ok" | "err" = "info";
+    if (isActivePhase(h)) {
+      const s = Math.max(0, Math.round((Date.now() - h!.phaseStart) / 1000));
+      const waiting = h!.waiters.length > 1 ? ` · ${h!.waiters.length - 1} waiting` : "";
+      switch (h!.phase) {
+        case "checking":
+          text = "Checking NInfer…" + waiting;
+          break;
+        case "suspending":
+          text = `Suspending ${h!.phaseModel}… ${s}s` + waiting;
+          break;
+        case "busy":
+          text = `NInfer busy - waiting… ${s}s` + waiting;
+          break;
+        case "draining":
+          text = `Submitting ${Math.min(h!.drainIndex + 1, h!.waiters.length)}/${h!.waiters.length} prompt(s)…`;
+          break;
+        default:
+          text = this._idleSummary();
+      }
+    } else if (lastOutcome) {
+      text = (lastOutcome.cancelled ? "↩ " : lastOutcome.isError ? "✗ " : "✓ ") + lastOutcome.text;
+      tone = lastOutcome.isError ? "err" : lastOutcome.cancelled ? "info" : "ok";
+    } else {
+      text = this._idleSummary();
     }
     st.statusText.textContent = text;
-    const active = st.phase === "suspending" || st.phase === "busy";
+    st.statusText.className =
+      "comfort-ninfer-status-text" + (tone === "err" ? " err" : tone === "ok" ? " ok" : "");
+    const active = isActivePhase(h);
     st.cancelBtn.hidden = !active;
     st.skipBtn.hidden = !active;
+    this._updateRowSpinners();
   }
 
-  _layout(): void {}
-
-  async refresh(fresh = false): Promise<void> {
+  async refresh(fresh: boolean, keepOutcome = false): Promise<void> {
     const st = this.st;
-    if (st.polling) return;
-    if (st.phase === "suspending" || st.phase === "busy") return;
+    if (st.refreshing) return;
+    // Don't disturb an in-progress suspend.
+    if (hold && (hold.phase === "checking" || hold.phase === "suspending" || hold.phase === "busy"))
+      return;
     const base = this._baseUrl();
     if (!base) {
       st.models = [];
-      st.selected = new Set();
+      st.modelsAt = 0;
       this._renderRows();
       this._renderStatus();
-      this._layout();
       return;
     }
-    st.polling = true;
+    st.refreshing = true;
     try {
-      const models = await fetchModels(base, !fresh);
-      st.models = models;
-      if (this.properties.selected == null) {
-        this.properties.selected = models
-          .filter((m) => m.value === "loaded")
-          .map((m) => m.id);
-      }
-      st.selected = this._computeSelected(models);
-      this._renderRows();
-      this._layout();
-      if ((st.phase === "done" || st.phase === "error") && st.resultHold > 0) {
-        st.resultHold--;
-      } else if (st.phase !== "idle") {
-        st.phase = "idle";
-        st.resultText = "";
-      }
+      const models = await fetchModels(base, fresh ? 0 : HOVER_WINDOW_MS);
+      this._setModels(models);
+      if (!keepOutcome) lastOutcome = null;
       this._renderStatus();
     } catch {
-      if (st.phase === "idle") {
-        st.phase = "error";
-        st.resultText = "NInfer unreachable";
+      if (!hold && !keepOutcome) {
+        lastOutcome = { text: "NInfer unreachable", isError: true, cancelled: false, at: Date.now() };
       }
       this._renderStatus();
     } finally {
-      st.polling = false;
+      st.refreshing = false;
     }
   }
+}
 
-  async suspendChecked(): Promise<{ proceed: boolean }> {
-    const st = this.st;
-    const base = this._baseUrl();
-    if (!base) return { proceed: true };
-    st.cancel = false;
-    st.skip = false;
-    st.abort = null;
+// --- Hold lifecycle (queue hook + batched waiters) ---
+
+// Fresh property read each call: TS's control-flow analysis otherwise
+// carries pre-await narrowing across async boundaries and flags the
+// "cancel" comparison as impossible.
+function _intent(h: Hold): Hold["intent"] {
+  return h.intent;
+}
+
+function _makeWaiter(args: unknown[]): Waiter {
+  let resolveDone: (v: unknown) => void = () => {};
+  let rejectDone: (e: unknown) => void = () => {};
+  const done = new Promise<unknown>((res, rej) => {
+    resolveDone = res;
+    rejectDone = rej;
+  });
+  return {
+    args,
+    done,
+    resolveDone,
+    rejectDone,
+    ready: Promise.resolve(),
+    state: "waiting",
+  };
+}
+
+async function _suspendOne(
+  h: Hold,
+  gate: NInferGateNode,
+  base: string,
+  m: NInferModel
+): Promise<boolean> {
+  const key = base + "|" + m.id;
+  if (h.covered.has(key)) return true;
+  h.phase = "suspending";
+  h.phaseModel = m.id;
+  h.phaseGate = gate;
+  h.phaseStart = Date.now();
+  renderHold();
+  const mStart = Date.now();
+  for (;;) {
+    if (h.intent !== "none") break;
+    const ac = new AbortController();
+    h.abort = ac;
+    let r: ForwardResult;
+    try {
+      r = await suspendModel(base, m.id, ac.signal);
+    } catch {
+      if (ac.signal.aborted) break;
+      throw new Error("suspend request failed");
+    }
+    if (r.status === 200) {
+      h.covered.add(key);
+      return true;
+    }
+    if (r.status === 409) {
+      h.phase = "busy";
+      renderHold();
+      await sleep(BUSY_RETRY_MS);
+      if (h.intent !== "none") break;
+      if (Date.now() - mStart > gate._timeoutMs())
+        throw new Error("timed out waiting for NInfer to idle");
+      continue;
+    }
+    throw new Error(`suspend failed (HTTP ${r.status})`);
+  }
+  return false;
+}
+
+async function _ensureTargets(h: Hold): Promise<void> {
+  // Re-check for models that became loaded since the pass (auto-resume).
+  for (const gate of Array.from(registry)) {
+    if (gate.removed || h.intent !== "none") continue;
+    const base = gate._baseUrl();
+    if (!base) continue;
     let models: NInferModel[];
     try {
-      models = await fetchModels(base, false);
+      // Always fresh: the gate must see the current model state, not a
+      // cached snapshot (auto-resume can load a model at any time).
+      models = await fetchModels(base, 0);
     } catch {
-      this._finish("NInfer unreachable", true);
-      return { proceed: false };
+      continue;
     }
-    st.models = models;
-    const selected = this._computeSelected(models);
-    st.selected = selected;
-    this._renderRows();
-    const targets = models.filter((m) => m.value === "loaded" && selected.has(m.id));
-    if (!targets.length) {
-      this._finish("Ready (nothing to suspend)", false);
-      return { proceed: true };
+    gate._setModels(models);
+    for (const m of models) {
+      if (h.intent !== "none") break;
+      if (m.value !== "loaded" || !gate.st.selected.has(m.id)) continue;
+      if (h.covered.has(base + "|" + m.id)) continue;
+      await _suspendOne(h, gate, base, m);
     }
-    const t0 = Date.now();
-    const timeoutMs = this._timeoutMs();
+  }
+}
+
+async function _runGatePass(h: Hold): Promise<boolean> {
+  for (const gate of Array.from(registry)) {
+    if (gate.removed) continue;
+    if (h.intent === "cancel" || h.intent === "skip") break;
+    const base = gate._baseUrl();
+    if (!base) continue;
+    let models: NInferModel[];
     try {
-      for (const m of targets) {
-        if (st.cancel || st.skip) break;
-        const mStart = Date.now();
-        this._beginSuspending(m.id, mStart);
-        for (;;) {
-          if (st.cancel || st.skip) break;
-          const ac = new AbortController();
-          st.abort = ac;
-          let r: ForwardResult;
-          try {
-            r = await suspendModel(base, m.id, ac.signal);
-          } catch {
-            if (ac.signal.aborted) break;
-            throw new Error("suspend request failed");
-          }
-          if (r.status === 200) break;
-          if (r.status === 409) {
-            this._setBusy(m.id, mStart);
-            await sleep(BUSY_RETRY_MS);
-            if (st.cancel || st.skip) break;
-            if (Date.now() - t0 > timeoutMs)
-              throw new Error("timed out waiting for NInfer to idle");
-            continue;
-          }
-          throw new Error(`suspend failed (HTTP ${r.status})`);
-        }
-      }
-      st.abort = null;
-      if (st.cancel) {
-        this._finish("Cancelled", false);
-        return { proceed: false };
-      }
-      if (st.skip) {
-        this._finish("Skipped - running now", false);
-        return { proceed: true };
-      }
-      const total = Math.round((Date.now() - t0) / 1000);
-      this._finish(
-        `Suspended ${targets.length} model${targets.length === 1 ? "" : "s"} (${total}s)`,
-        false
-      );
-      st.resultHold = 2;
-      try {
-        await this.refresh(true);
-      } catch {}
-      return { proceed: true };
-    } catch (e) {
-      this._finish(e instanceof Error ? e.message : String(e), true);
-      return { proceed: false };
-    } finally {
-      st.abort = null;
+      // Always fresh: the gate must see the current model state, not a
+      // cached snapshot (auto-resume can load a model at any time).
+      models = await fetchModels(base, 0);
+    } catch {
+      h.resultText = "NInfer unreachable";
+      h.isError = true;
+      return false;
+    }
+    gate._setModels(models);
+    for (const m of models) {
+      if (h.intent !== "none") break;
+      if (m.value !== "loaded" || !gate.st.selected.has(m.id)) continue;
+      if (h.covered.has(base + "|" + m.id)) continue;
+      await _suspendOne(h, gate, base, m);
     }
   }
+  return h.intent !== "cancel";
+}
 
-  _beginSuspending(model: string, start: number): void {
-    this.st.phase = "suspending";
-    this.st.phaseModel = model;
-    this.st.phaseStart = start;
-    this._renderStatus();
-  }
-  _setBusy(model: string, start: number): void {
-    this.st.phase = "busy";
-    this.st.phaseModel = model;
-    this.st.phaseStart = start;
-    this._renderStatus();
-  }
-  _finish(text: string, isError: boolean): void {
-    this.st.phase = isError ? "error" : "done";
-    this.st.resultText = text;
-    this._renderStatus();
-  }
-
-  getHelp(): string {
-    return `<p>Frees GPU memory for ComfyUI by suspending selected NInfer models on queue.</p>`;
+async function _drainWaiters(h: Hold): Promise<void> {
+  for (const w of h.waiters) {
+    if (w.state !== "waiting") continue;
+    if (_intent(h) === "cancel") break;
+    await w.ready;
+    if (_intent(h) === "cancel") break;
+    if (w.state !== "waiting") continue;
+    w.state = "submitting";
+    h.phase = "draining";
+    h.drainIndex = h.waiters.filter((x) => x.state !== "waiting").length - 1;
+    renderHold();
+    try {
+      const r = await (origQueue as (...a: unknown[]) => Promise<unknown>).apply(
+        app,
+        w.args
+      );
+      w.resolveDone(r);
+    } catch (e) {
+      w.rejectDone(e);
+    }
+    w.state = "settled";
   }
 }
 
-// --- Timers ---
-
-function _ensureTimers(): void {
-  if (!ambientTimer) {
-    ambientTimer = setInterval(() => {
-      if (document.hidden) return;
-      for (const n of registry) {
-        if (n.removed) continue;
-        try {
-          n.refresh();
-        } catch {}
-      }
-    }, AMBIENT_MS);
-  }
-  if (!elapsedTimer) {
-    elapsedTimer = setInterval(() => {
-      for (const n of registry) {
-        if (n.removed) continue;
-        try {
-          n.updateLiveStatus();
-        } catch {}
-      }
-    }, ELAPSED_MS);
+function _endHold(h: Hold): void {
+  const total = Math.round((Date.now() - h.startedAt) / 1000);
+  if (h.phase === "queued") h.resultText += ` · gate ${total}s`;
+  lastOutcome = {
+    text: h.resultText,
+    isError: h.phase === "error",
+    cancelled: h.phase === "cancelled",
+    at: Date.now(),
+  };
+  hold = null;
+  renderHold();
+  _stopTicker();
+  // Hold end is an event: refresh model lists (the gate just changed
+  // them) without wiping the outcome text shown above.
+  for (const g of Array.from(registry)) {
+    if (!g.removed) g.refresh(true, true).catch(() => {});
   }
 }
 
-// --- Queue hook ---
+async function _startHold(args: unknown[]): Promise<unknown> {
+  const h: Hold = {
+    phase: "checking",
+    phaseModel: "",
+    phaseGate: null,
+    phaseStart: Date.now(),
+    waiters: [],
+    intent: "none",
+    abort: null,
+    resultText: "",
+    isError: false,
+    covered: new Set(),
+    startedAt: Date.now(),
+    drainIndex: 0,
+  };
+  hold = h;
+  lastOutcome = null;
+  const w = _makeWaiter(args);
+  h.waiters.push(w);
+  _startTicker();
+  renderHold();
+  try {
+    const pass = await _runGatePass(h);
+    if (_intent(h) === "cancel") {
+      h.phase = "cancelled";
+      h.resultText = "Cancelled";
+    } else if (!pass) {
+      h.phase = "error";
+      if (!h.resultText) h.resultText = "Gate failed";
+    } else {
+      await _drainWaiters(h);
+      if (_intent(h) === "cancel") {
+        h.phase = "cancelled";
+        h.resultText = "Cancelled";
+      } else {
+        h.phase = "queued";
+        h.resultText = `Queued ${h.waiters.length} prompt(s)`;
+      }
+    }
+  } catch (e) {
+    h.phase = "error";
+    h.resultText = e instanceof Error ? e.message : String(e);
+  }
+  // Settle any waiters not settled by the drain (cancel/error paths).
+  for (const wtr of h.waiters) {
+    if (wtr.state === "settled") continue;
+    wtr.state = "settled";
+    wtr.resolveDone(undefined);
+  }
+  _endHold(h);
+  return w.done;
+}
+
+function _joinHold(args: unknown[]): Promise<unknown> {
+  const h = hold!;
+  const w = _makeWaiter(args);
+  h.waiters.push(w);
+  // Re-check for models that became loaded since the pass's fetch (e.g.
+  // NInfer auto-resume) before this waiter is submitted. Serialized so
+  // concurrent joins don't overlap; safe to run while the pass is active
+  // (covered set + 409 handling dedupe).
+  const p = ensureChain.then(() => _ensureTargets(h));
+  ensureChain = p.catch(() => {});
+  // A recheck failure must not fail the drain; the pass already covered
+  // what it saw.
+  w.ready = p.catch(() => {});
+  renderHold();
+  return w.done;
+}
 
 function _installHooks(): void {
   if (hooksInstalled) return;
   hooksInstalled = true;
-  const orig = app.queuePrompt;
-  app.queuePrompt = async function (...args: unknown[]) {
-    let proceed = true;
-    for (const gate of Array.from(registry)) {
-      if (gate.removed) continue;
-      _setSpinner(true);
-      const v = await gate.suspendChecked();
-      _setSpinner(false);
-      if (!v.proceed) {
-        proceed = false;
-        break;
-      }
-    }
-    if (!proceed) return Promise.resolve();
-    return (orig as (...a: unknown[]) => Promise<unknown>).apply(app, args);
+  origQueue = app.queuePrompt as (...a: unknown[]) => Promise<unknown>;
+  app.queuePrompt = async function (...args: unknown[]): Promise<unknown> {
+    const active = Array.from(registry).filter((g) => !g.removed && g._baseUrl());
+    if (!active.length) return origQueue!.apply(app, args);
+    if (!hold) return _startHold(args);
+    return _joinHold(args);
   };
+  // Graph switch: update focus-button visibility (event-driven).
+  const canvas = (app as unknown as { canvas?: { setGraph?: (g: unknown) => unknown } }).canvas;
+  if (canvas && typeof canvas.setGraph === "function") {
+    const origSetGraph = canvas.setGraph;
+    canvas.setGraph = function (g: unknown) {
+      const r = origSetGraph.call(this, g);
+      _updateFocusVisibility();
+      return r;
+    };
+  }
 }
 
-function _setSpinner(on: boolean): void {
-  if (focusBtn) focusBtn.classList.toggle("ninfer-spinning", on);
-}
-
-// --- Focus button ---
+// --- Chrome focus button (created once, event-driven) ---
 
 let focusBtn: HTMLButtonElement | null = null;
+let focusLabel: HTMLSpanElement | null = null;
 
 function _currentGraph(): unknown {
   return (app as unknown as { canvas?: { graph?: unknown }; graph?: unknown }).canvas?.graph ??
@@ -733,7 +950,7 @@ function _currentGraph(): unknown {
     null;
 }
 
-function _findFocusableGate(): (ComfortVirtualNode & NInferGateNode) | null {
+function _findFocusableGate(): NInferGateNode | null {
   const g = _currentGraph();
   if (!g) return null;
   for (const gate of registry) {
@@ -746,38 +963,81 @@ function _ensureFocusButton(): void {
   if (focusBtn && focusBtn.isConnected) return;
   const anchor = document.querySelector('[data-testid="queue-button"]');
   if (!anchor || !anchor.parentElement) return;
-  const btn = document.createElement("button");
-  btn.type = "button";
-  btn.className = "comfort-topbar-focus";
-  btn.title = "Focus NInfer gate";
-  const spinner = document.createElement("span");
-  spinner.className = "ninfer-spinner";
-  const label = document.createElement("span");
-  label.className = "ninfer-label";
-  label.textContent = "⚡ NInfer";
-  btn.appendChild(spinner);
-  btn.appendChild(label);
-  btn.addEventListener("click", () => {
-    const gate = _findFocusableGate();
-    if (!gate) return;
-    const graph = gate.graph as { _nodes?: { selected: boolean }[] } | null;
-    if (graph) {
-      for (const n of graph._nodes || []) n.selected = false;
-      gate.selected = true;
-    }
-    const canvas = (app as unknown as { canvas?: CanvasLike }).canvas;
-    if (!canvas) return;
-    const size = gate.size || [200, 150];
-    const cEl = canvas.canvas as HTMLCanvasElement | null;
-    const vw = (cEl && cEl.clientWidth) || window.innerWidth;
-    const vh = (cEl && cEl.clientHeight) || window.innerHeight;
-    const fit = Math.min((vw * 0.5) / (size[0] || 200), (vh * 0.5) / (size[1] || 150));
-    canvas.ds.scale = Math.min(Math.max(fit, 0.75), 2.0);
-    canvas.centerOnNode(gate);
-    canvas.setDirty(true);
-  });
-  anchor.parentElement.appendChild(btn);
-  focusBtn = btn;
+  if (!focusBtn) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "comfort-topbar-focus";
+    btn.title = "NInfer gate";
+    const spinner = document.createElement("span");
+    spinner.className = "ninfer-spinner";
+    focusLabel = document.createElement("span");
+    focusLabel.className = "ninfer-label";
+    focusLabel.textContent = "⚡ NInfer";
+    btn.appendChild(spinner);
+    btn.appendChild(focusLabel);
+    btn.addEventListener("click", () => {
+      const gate = _findFocusableGate();
+      if (!gate) return;
+      gate.refresh(true);
+      const graph = gate.graph as { _nodes?: { selected: boolean }[] } | null;
+      if (graph) {
+        for (const n of graph._nodes || []) n.selected = false;
+        gate.selected = true;
+      }
+      const canvas = (app as unknown as { canvas?: CanvasLike }).canvas;
+      if (!canvas) return;
+      const size = gate.size || [200, 150];
+      const cEl = canvas.canvas as HTMLCanvasElement | null;
+      const vw = (cEl && cEl.clientWidth) || window.innerWidth;
+      const vh = (cEl && cEl.clientHeight) || window.innerHeight;
+      const fit = Math.min((vw * 0.5) / (size[0] || 200), (vh * 0.5) / (size[1] || 150));
+      canvas.ds.scale = Math.min(Math.max(fit, 0.75), 2.0);
+      canvas.centerOnNode(gate);
+      canvas.setDirty(true);
+    });
+    focusBtn = btn;
+  }
+  anchor.parentElement.appendChild(focusBtn);
+  _updateFocusVisibility();
+  _renderFocusButton();
+}
+
+function _updateFocusVisibility(): void {
+  if (!focusBtn) return;
+  const gate = _findFocusableGate();
+  focusBtn.style.display = gate ? "" : "none";
+}
+
+function _renderFocusButton(): void {
+  if (!focusBtn || !focusBtn.isConnected || !focusLabel) return;
+  const h = hold;
+  let cls = "comfort-topbar-focus";
+  let title = "NInfer gate";
+  if (isActivePhase(h)) {
+    const s = Math.max(0, Math.round((Date.now() - h!.phaseStart) / 1000));
+    focusLabel.textContent = h!.phase === "draining" ? "queueing…" : `${s}s`;
+    cls += " ninfer-spinning";
+    title = h!.phase === "suspending"
+      ? `Suspending ${h!.phaseModel}…`
+      : h!.phase === "busy"
+        ? "NInfer busy - waiting"
+        : h!.phase === "draining"
+          ? "Submitting to ComfyUI"
+          : "Checking NInfer";
+    if (h!.waiters.length > 1) title += ` · ${h!.waiters.length - 1} waiting`;
+  } else if (lastOutcome) {
+    focusLabel.textContent = lastOutcome.cancelled
+      ? "↩ NInfer"
+      : lastOutcome.isError
+        ? "✗ NInfer"
+        : "✓ NInfer";
+    cls += lastOutcome.isError ? " ninfer-error" : lastOutcome.cancelled ? "" : " ninfer-ok";
+    title = lastOutcome.text;
+  } else {
+    focusLabel.textContent = "⚡ NInfer";
+  }
+  focusBtn.className = cls;
+  focusBtn.title = title;
 }
 
 interface CanvasLike {
@@ -787,16 +1047,20 @@ interface CanvasLike {
   setDirty(dirty: boolean): void;
 }
 
-setInterval(() => {
+// --- Event wiring ---
+
+_ensureFocusButton();
+new MutationObserver(() => {
+  if (focusBtn && focusBtn.isConnected) return;
   _ensureFocusButton();
-  if (!focusBtn) return;
-  const gate = _findFocusableGate();
-  focusBtn.style.display = gate ? "" : "none";
-  if (gate) {
-    const spinning = gate.st?.phase === "suspending" || gate.st?.phase === "busy";
-    focusBtn.classList.toggle("ninfer-spinning", spinning);
+}).observe(document.body, { childList: true, subtree: true });
+
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState !== "visible") return;
+  for (const g of Array.from(registry)) {
+    if (!g.removed) g.refresh(true);
   }
-}, 500);
+});
 
 // --- Register ---
 

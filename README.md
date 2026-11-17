@@ -62,20 +62,35 @@ main menu bar.
 A node that frees GPU memory for ComfyUI by suspending selected NInfer models on queue.
 
 - Set the **NInfer URL** (e.g. `http://host:30001`).
-- The node polls `/v1/models` and lists each model with its status. **loaded**
-  models are selectable (checked by default). **Select all** / **Deselect all**
-  for bulk control.
-- On every Run, each checked loaded model is suspended
-  (`POST /v1/models/{id}/suspend`) and the queue is held until it returns.
-- If NInfer is busy (`409 model_busy`) the gate waits and retries until it
-  idles or the **busy timeout** elapses (default *indefinite*, or a number of
-  minutes).
-- Suspended models stay suspended (this plugin never resumes them).
+- The node lists NInfer models with their status. **loaded** models are
+  selectable (checked by default). **Select all** / **Deselect all** for bulk
+  control. Model state is refreshed on demand (hover, URL change, Run, hold
+  start/end) - it is never polled.
+- On Run, each checked loaded model is suspended
+  (`POST /v1/models/{id}/suspend`) and the prompt is held until every suspend
+  completes.
+- Further Run clicks during a hold **join** it: all held prompts are queued in
+  click order as soon as the last suspend finishes.
+- If NInfer is busy (`409 model_busy`) the gate waits and retries every 5 s
+  until it idles or the **busy timeout** elapses (default *indefinite*, or a
+  number of minutes).
+- While a hold is active, the node and the top-bar button show live status
+  ("Suspending…", "NInfer busy - waiting…", "✓ Queued N prompt(s) · gate Ns").
+  **Cancel** drops the held prompts; **Skip** queues them without suspending.
+- Suspended models stay suspended (this plugin never resumes them). If NInfer's
+  `auto_resume` reloads a model later, the next Run suspends it again.
 - NInfer calls go through a Python proxy (`/comfort/ninfer/forward`) to avoid
   CORS between the browser and NInfer.
 - A top-bar **NInfer** button appears while a gate is in the current graph.
-  Clicking it focuses and zooms to the gate. A spinner shows while a suspend
-  is in progress.
+  Clicking it focuses and zooms to the gate; a spinner and live label show
+  while a hold is in progress.
+
+## Auto-purge on queue drain
+
+A top-bar dropdown (**Auto purge VRAM**: off / soft / deep) purges VRAM
+automatically the moment the queue drains. The >0 → 0 transition is read from
+ComfyUI's `status` websocket event - no background polling. It fires only while
+the tab is visible, and your choice persists across reloads (localStorage).
 
 ## Notes / caveats
 

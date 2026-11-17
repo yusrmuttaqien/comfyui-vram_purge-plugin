@@ -7,7 +7,12 @@
     "noEmit": true,
     "skipLibCheck": true,
     "esModuleInterop": true,
-    "lib": ["ES2020", "DOM"]
+    "lib": ["ES2020", "DOM"],
+    "baseUrl": ".",
+    "paths": {
+      "/scripts/app.js": ["types/scripts-app.d.ts"],
+      "/scripts/api.js": ["types/scripts-api.d.ts"]
+    }
   },
-  "include": ["src/**/*.ts"]
+  "include": ["src/**/*.ts", "types/**/*.d.ts"]
 }
