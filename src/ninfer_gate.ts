@@ -183,6 +183,7 @@ const CSS = `
 .comfort-ninfer-row.off { opacity: 0.5; }
 .comfort-ninfer-row .ninfer-spinner { display: none; }
 .comfort-ninfer-row.suspending .ninfer-spinner { display: inline-block; }
+.comfort-ninactive { opacity: 0.55; }
 .comfort-node-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .comfort-ninfer-badge {
   font-size: 10px; padding: 1px 5px; border-radius: 3px;
@@ -202,6 +203,8 @@ const CSS = `
 .comfort-topbar-focus.ninfer-spinning .ninfer-label { display: none; }
 .comfort-topbar-focus .ninfer-spinner { display: none; }
 .comfort-topbar-focus.ninfer-spinning .ninfer-spinner { display: inline-block; }
+.comfort-topbar-focus.ninfer-inactive { opacity: 0.6; border-style: dashed; }
+.comfort-topbar-focus.ninfer-inactive:hover { opacity: 1; }
 .ninfer-spinner {
   width: 12px; height: 12px; border: 2px solid #888; border-top-color: #eee;
   border-radius: 50%; animation: ninfer-spin 0.8s linear infinite; vertical-align: middle;
@@ -248,6 +251,7 @@ class ComfortVirtualNode extends LGraphNode {
   isVirtualNode = true;
   removed = false;
   configuring = false;
+  declare mode: number;
   private __comfort_mode = 0;
   onModeChange?: (old: number, mode: number) => void;
 
@@ -339,6 +343,14 @@ let origQueue: ((...a: unknown[]) => Promise<unknown>) | null = null;
 
 class NInferGateNode extends ComfortVirtualNode {
   st: GateState;
+
+  // Bypass/mute (or restore) of this gate: re-render state without a
+  // model fetch. During deserialization, onAdded/refresh renders.
+  onModeChange = (_old: number, _mode: number): void => {
+    if (this.configuring || !this.st) return;
+    this._renderStatus();
+    _renderFocusButton();
+  };
 
   constructor() {
     super(NINFER_GATE);
@@ -619,6 +631,7 @@ class NInferGateNode extends ComfortVirtualNode {
     const h = hold;
     let text: string;
     let tone: "info" | "ok" | "err" = "info";
+    const inactive = this.mode !== 0;
     if (isActivePhase(h)) {
       const s = Math.max(0, Math.round((Date.now() - h!.phaseStart) / 1000));
       const waiting = h!.waiters.length > 1 ? ` · ${h!.waiters.length - 1} waiting` : "";
@@ -638,6 +651,8 @@ class NInferGateNode extends ComfortVirtualNode {
         default:
           text = this._idleSummary();
       }
+    } else if (inactive) {
+      text = "Inactive (bypassed/muted)";
     } else if (lastOutcome) {
       text = (lastOutcome.cancelled ? "↩ " : lastOutcome.isError ? "✗ " : "✓ ") + lastOutcome.text;
       tone = lastOutcome.isError ? "err" : lastOutcome.cancelled ? "info" : "ok";
@@ -650,6 +665,7 @@ class NInferGateNode extends ComfortVirtualNode {
     const active = isActivePhase(h);
     st.cancelBtn.hidden = !active;
     st.skipBtn.hidden = !active;
+    st.el.classList.toggle("comfort-ninactive", inactive && !active);
     this._updateRowSpinners();
   }
 
@@ -756,7 +772,7 @@ async function _suspendOne(
 async function _ensureTargets(h: Hold): Promise<void> {
   // Re-check for models that became loaded since the pass (auto-resume).
   for (const gate of Array.from(registry)) {
-    if (gate.removed || h.intent !== "none") continue;
+    if (gate.removed || gate.mode !== 0 || h.intent !== "none") continue;
     const base = gate._baseUrl();
     if (!base) continue;
     let models: NInferModel[];
@@ -779,7 +795,7 @@ async function _ensureTargets(h: Hold): Promise<void> {
 
 async function _runGatePass(h: Hold): Promise<boolean> {
   for (const gate of Array.from(registry)) {
-    if (gate.removed) continue;
+    if (gate.removed || gate.mode !== 0) continue;
     if (h.intent === "cancel" || h.intent === "skip") break;
     const base = gate._baseUrl();
     if (!base) continue;
@@ -922,7 +938,9 @@ function _installHooks(): void {
   hooksInstalled = true;
   origQueue = app.queuePrompt as (...a: unknown[]) => Promise<unknown>;
   app.queuePrompt = async function (...args: unknown[]): Promise<unknown> {
-    const active = Array.from(registry).filter((g) => !g.removed && g._baseUrl());
+    const active = Array.from(registry).filter(
+      (g) => !g.removed && g.mode === 0 && g._baseUrl()
+    );
     if (!active.length) return origQueue!.apply(app, args);
     if (!hold) return _startHold(args);
     return _joinHold(args);
@@ -1008,6 +1026,20 @@ function _updateFocusVisibility(): void {
   focusBtn.style.display = gate ? "" : "none";
 }
 
+// True when the current graph has gate nodes but none of them is active
+// (all bypassed/muted). The chrome button stays visible in that state.
+function _allGatesInactive(): boolean {
+  const g = _currentGraph();
+  if (!g) return false;
+  let any = false;
+  for (const gate of registry) {
+    if (gate.removed || gate.graph !== g) continue;
+    any = true;
+    if (gate.mode === 0) return false;
+  }
+  return any;
+}
+
 function _renderFocusButton(): void {
   if (!focusBtn || !focusBtn.isConnected || !focusLabel) return;
   const h = hold;
@@ -1025,6 +1057,10 @@ function _renderFocusButton(): void {
           ? "Submitting to ComfyUI"
           : "Checking NInfer";
     if (h!.waiters.length > 1) title += ` · ${h!.waiters.length - 1} waiting`;
+  } else if (_allGatesInactive()) {
+    focusLabel.textContent = "⚡ NInfer · off";
+    cls += " ninfer-inactive";
+    title = "NInfer gate is bypassed/muted — click to focus";
   } else if (lastOutcome) {
     focusLabel.textContent = lastOutcome.cancelled
       ? "↩ NInfer"

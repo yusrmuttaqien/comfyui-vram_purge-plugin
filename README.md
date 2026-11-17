@@ -84,6 +84,14 @@ A node that frees GPU memory for ComfyUI by suspending selected NInfer models on
 - A top-bar **NInfer** button appears while a gate is in the current graph.
   Clicking it focuses and zooms to the gate; a spinner and live label show
   while a hold is in progress.
+- **Bypass / mute deactivates a gate.** When the node's mode is anything but
+  *Always* (right-click → *Bypass*, or mute), it no longer holds Run: the
+  prompt goes straight to ComfyUI and no suspend calls are made. The node
+  shows "Inactive (bypassed/muted)" and is dimmed. The top-bar button stays
+  visible for as long as the node is in the workflow, shows "⚡ NInfer · off"
+  (dashed, dimmed) when every gate in the graph is inactive, and still focuses
+  the node on click. Restoring *Always* reactivates the gate immediately -
+  mode changes are picked up as events, no polling.
 
 ## Auto-purge on queue drain
 

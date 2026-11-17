@@ -76,6 +76,7 @@ var CSS = `
 .comfort-ninfer-row.off { opacity: 0.5; }
 .comfort-ninfer-row .ninfer-spinner { display: none; }
 .comfort-ninfer-row.suspending .ninfer-spinner { display: inline-block; }
+.comfort-ninactive { opacity: 0.55; }
 .comfort-node-title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .comfort-ninfer-badge {
   font-size: 10px; padding: 1px 5px; border-radius: 3px;
@@ -95,6 +96,8 @@ var CSS = `
 .comfort-topbar-focus.ninfer-spinning .ninfer-label { display: none; }
 .comfort-topbar-focus .ninfer-spinner { display: none; }
 .comfort-topbar-focus.ninfer-spinning .ninfer-spinner { display: inline-block; }
+.comfort-topbar-focus.ninfer-inactive { opacity: 0.6; border-style: dashed; }
+.comfort-topbar-focus.ninfer-inactive:hover { opacity: 1; }
 .ninfer-spinner {
   width: 12px; height: 12px; border: 2px solid #888; border-top-color: #eee;
   border-radius: 50%; animation: ninfer-spin 0.8s linear infinite; vertical-align: middle;
@@ -188,6 +191,13 @@ var origQueue = null;
 var NInferGateNode = class extends ComfortVirtualNode {
   constructor() {
     super(NINFER_GATE);
+    // Bypass/mute (or restore) of this gate: re-render state without a
+    // model fetch. During deserialization, onAdded/refresh renders.
+    this.onModeChange = (_old, _mode) => {
+      if (this.configuring || !this.st) return;
+      this._renderStatus();
+      _renderFocusButton();
+    };
     this.properties = { url: "", timeout: "indefinite", selected: null };
     this.setSize([MIN_W, 200]);
     this.st = this._setupWidget();
@@ -433,6 +443,7 @@ var NInferGateNode = class extends ComfortVirtualNode {
     const h = hold;
     let text;
     let tone = "info";
+    const inactive = this.mode !== 0;
     if (isActivePhase(h)) {
       const s = Math.max(0, Math.round((Date.now() - h.phaseStart) / 1e3));
       const waiting = h.waiters.length > 1 ? ` \xB7 ${h.waiters.length - 1} waiting` : "";
@@ -452,6 +463,8 @@ var NInferGateNode = class extends ComfortVirtualNode {
         default:
           text = this._idleSummary();
       }
+    } else if (inactive) {
+      text = "Inactive (bypassed/muted)";
     } else if (lastOutcome) {
       text = (lastOutcome.cancelled ? "\u21A9 " : lastOutcome.isError ? "\u2717 " : "\u2713 ") + lastOutcome.text;
       tone = lastOutcome.isError ? "err" : lastOutcome.cancelled ? "info" : "ok";
@@ -463,6 +476,7 @@ var NInferGateNode = class extends ComfortVirtualNode {
     const active = isActivePhase(h);
     st.cancelBtn.hidden = !active;
     st.skipBtn.hidden = !active;
+    st.el.classList.toggle("comfort-ninactive", inactive && !active);
     this._updateRowSpinners();
   }
   async refresh(fresh, keepOutcome = false) {
@@ -554,7 +568,7 @@ async function _suspendOne(h, gate, base, m) {
 }
 async function _ensureTargets(h) {
   for (const gate of Array.from(registry)) {
-    if (gate.removed || h.intent !== "none") continue;
+    if (gate.removed || gate.mode !== 0 || h.intent !== "none") continue;
     const base = gate._baseUrl();
     if (!base) continue;
     let models;
@@ -574,7 +588,7 @@ async function _ensureTargets(h) {
 }
 async function _runGatePass(h) {
   for (const gate of Array.from(registry)) {
-    if (gate.removed) continue;
+    if (gate.removed || gate.mode !== 0) continue;
     if (h.intent === "cancel" || h.intent === "skip") break;
     const base = gate._baseUrl();
     if (!base) continue;
@@ -704,7 +718,9 @@ function _installHooks() {
   hooksInstalled = true;
   origQueue = app.queuePrompt;
   app.queuePrompt = async function(...args) {
-    const active = Array.from(registry).filter((g) => !g.removed && g._baseUrl());
+    const active = Array.from(registry).filter(
+      (g) => !g.removed && g.mode === 0 && g._baseUrl()
+    );
     if (!active.length) return origQueue.apply(app, args);
     if (!hold) return _startHold(args);
     return _joinHold(args);
@@ -779,6 +795,17 @@ function _updateFocusVisibility() {
   const gate = _findFocusableGate();
   focusBtn.style.display = gate ? "" : "none";
 }
+function _allGatesInactive() {
+  const g = _currentGraph();
+  if (!g) return false;
+  let any = false;
+  for (const gate of registry) {
+    if (gate.removed || gate.graph !== g) continue;
+    any = true;
+    if (gate.mode === 0) return false;
+  }
+  return any;
+}
 function _renderFocusButton() {
   if (!focusBtn || !focusBtn.isConnected || !focusLabel) return;
   const h = hold;
@@ -790,6 +817,10 @@ function _renderFocusButton() {
     cls += " ninfer-spinning";
     title = h.phase === "suspending" ? `Suspending ${h.phaseModel}\u2026` : h.phase === "busy" ? "NInfer busy - waiting" : h.phase === "draining" ? "Submitting to ComfyUI" : "Checking NInfer";
     if (h.waiters.length > 1) title += ` \xB7 ${h.waiters.length - 1} waiting`;
+  } else if (_allGatesInactive()) {
+    focusLabel.textContent = "\u26A1 NInfer \xB7 off";
+    cls += " ninfer-inactive";
+    title = "NInfer gate is bypassed/muted \u2014 click to focus";
   } else if (lastOutcome) {
     focusLabel.textContent = lastOutcome.cancelled ? "\u21A9 NInfer" : lastOutcome.isError ? "\u2717 NInfer" : "\u2713 NInfer";
     cls += lastOutcome.isError ? " ninfer-error" : lastOutcome.cancelled ? "" : " ninfer-ok";
