@@ -3,7 +3,7 @@ from typing_extensions import override
 from comfy_api.latest import ComfyExtension, io
 
 from .server_purge import register_purge_route
-from .server_ninfer import register_ninfer_routes
+from .server_llm import register_llm_routes
 
 
 WEB_DIRECTORY = "./web"
@@ -17,7 +17,7 @@ class VRAMPurgeExtension(ComfyExtension):
     @override
     async def on_load(self) -> None:
         register_purge_route()
-        register_ninfer_routes()
+        register_llm_routes()
 
 
 async def comfy_entrypoint() -> VRAMPurgeExtension:
