@@ -1,6 +1,6 @@
 {
   "name": "comfyui-vram-purge-plugin",
-  "version": "1.4.0",
+  "version": "2.0.0",
   "private": true,
   "scripts": {
     "build": "esbuild src/purge_menu.ts --bundle --outfile=web/purge_menu.js --format=esm --external:/scripts/app.js --external:/scripts/api.js && esbuild src/llm_gate.ts --bundle --outfile=web/llm_gate.js --format=esm --external:/scripts/app.js",
